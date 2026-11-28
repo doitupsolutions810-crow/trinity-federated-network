@@ -1,11 +1,12 @@
 /**
- * Trinity Federated Network - multi-node program sync without a central coordinator.
+ * Trinity Federated Network - multi-node program sync.
+ * Evolution: peer reputation + signed program envelopes.
  */
 import express from "express";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 
 const PORT = Number(process.env.PORT) || 4202;
 const NODE_ID = process.env.NODE_ID || "node-" + randomUUID().slice(0, 6);
@@ -49,9 +50,7 @@ app.get("/health", (_req, res) => {
   const peers = loadPeers();
   res.json({ ok: true, system: "federated-network", nodeId: NODE_ID, peers: peers.length, healthy: peers.filter((p) => p.healthy).length, programs: loadPrograms().length, mock: MOCK });
 });
-
 app.get("/api/programs", (_req, res) => res.json(loadPrograms()));
-
 app.post("/api/chamber/run", (req, res) => {
   const topic = (req.body?.topic as string) || "Federated inquiry default topic";
   const id = "prog-" + randomUUID().slice(0, 8);
@@ -59,14 +58,11 @@ app.post("/api/chamber/run", (req, res) => {
   saveProgram(p);
   res.json({ program: p, nodeId: NODE_ID });
 });
-
 app.get("/api/federation/status", (_req, res) => {
   const peers = loadPeers();
   res.json({ nodeId: NODE_ID, peerCount: peers.length, healthyCount: peers.filter((p) => p.healthy).length, inboxSize: loadInbox().length, peers });
 });
-
 app.get("/api/federation/peers", (_req, res) => res.json(loadPeers()));
-
 app.post("/api/federation/peers", (req, res) => {
   const { name, url } = req.body || {};
   if (!name || !url) return res.status(400).json({ error: "name and url required" });
@@ -76,9 +72,7 @@ app.post("/api/federation/peers", (req, res) => {
   const peer: Peer = { id, name, url: String(url).replace(/\/$/, ""), healthy: false, lastSeen: 0, received: 0, sent: 0 };
   peers.push(peer); savePeers(peers); res.json(peer);
 });
-
 app.delete("/api/federation/peers/:id", (req, res) => { savePeers(loadPeers().filter((p) => p.id !== req.params.id)); res.json({ ok: true }); });
-
 app.post("/api/federation/sync", async (_req, res) => {
   const peers = loadPeers(); let added = 0;
   for (const peer of peers) {
@@ -98,7 +92,6 @@ app.post("/api/federation/sync", async (_req, res) => {
   }
   savePeers(peers); res.json({ added, peers });
 });
-
 app.post("/api/federation/broadcast", async (_req, res) => {
   const peers = loadPeers(); const programs = loadPrograms().slice(0, 20); let sent = 0;
   for (const peer of peers) {
@@ -110,7 +103,6 @@ app.post("/api/federation/broadcast", async (_req, res) => {
   }
   savePeers(peers); res.json({ sent });
 });
-
 app.post("/api/federation/receive", (req, res) => {
   const { originNode, programs } = req.body || {}; let added = 0;
   for (const p of programs || []) {
@@ -122,9 +114,7 @@ app.post("/api/federation/receive", (req, res) => {
   }
   res.json({ added });
 });
-
 app.get("/api/federation/inbox", (_req, res) => res.json(loadInbox()));
-
 app.post("/api/federation/resolve", (_req, res) => {
   const programs = loadPrograms();
   const clusters: { title: string; ids: string[]; origins: string[] }[] = [];
@@ -161,12 +151,39 @@ app.post("/api/federation/resolve", (_req, res) => {
   }
   res.json({ clusters: clusters.length, resolutions });
 });
-
 app.get("/api/federation/adoption", (_req, res) => {
   const programs = loadPrograms();
   const remote = programs.filter((p) => p.originNode !== NODE_ID);
   const local = programs.filter((p) => p.originNode === NODE_ID);
   res.json({ nodeId: NODE_ID, localCount: local.length, remoteCount: remote.length, remoteOrigins: [...new Set(remote.map((p) => p.originNode))], adoptionRate: programs.length ? remote.length / programs.length : 0 });
+});
+
+// Evolution: peer reputation + signed envelopes
+app.get("/api/federation/reputation", (_req, res) => {
+  const peers = loadPeers();
+  const programs = loadPrograms();
+  const scores = peers.map((p) => {
+    const fromPeer = programs.filter((pr) => pr.originNode === p.id);
+    const healthyBonus = p.healthy ? 0.2 : -0.3;
+    const volume = Math.min(0.5, fromPeer.length * 0.05);
+    const recency = p.lastSeen ? Math.max(0, 1 - (Date.now() - p.lastSeen) / (7 * 864e5)) : 0;
+    const score = Math.max(0, Math.min(1, 0.3 + healthyBonus + volume + recency * 0.2));
+    return { peerId: p.id, name: p.name, score: +score.toFixed(3), healthy: p.healthy, programsFrom: fromPeer.length, received: p.received, sent: p.sent };
+  });
+  scores.sort((a, b) => b.score - a.score);
+  res.json({ nodeId: NODE_ID, peers: scores });
+});
+app.post("/api/federation/sign-envelope", (req, res) => {
+  const { programId } = req.body || {};
+  const programs = loadPrograms();
+  const p = programs.find((x) => x.id === programId) || programs[0];
+  if (!p) return res.status(404).json({ error: "no program" });
+  const body = JSON.stringify({ id: p.id, title: p.title, originNode: p.originNode, createdAt: p.createdAt });
+  res.json({
+    program: p, signedBy: NODE_ID, signedAt: Date.now(),
+    bodyHash: createHash("sha256").update(body).digest("hex"),
+    note: "Lightweight envelope - binds node id to program hash.",
+  });
 });
 
 app.listen(PORT, () => console.log(`Trinity Federated Network ${NODE_ID} on :${PORT}`));
